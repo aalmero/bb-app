@@ -1,0 +1,140 @@
+services:
+  # MongoDB Database Service
+  mongodb:
+    image: mongo:7
+    container_name: bb-mongodb
+    restart: unless-stopped
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_DATABASE: ${DATABASE_NAME:-bb-db}
+    volumes:
+      - mongodb_data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d
+    networks:
+      - bb-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: ${HEALTH_CHECK_INTERVAL:-10}s
+      timeout: ${HEALTH_CHECK_TIMEOUT:-5}s
+      retries: ${HEALTH_CHECK_RETRIES:-5}
+      start_period: ${HEALTH_CHECK_START_PERIOD:-30}s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-3}"
+
+  # API Service (Backend)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev.api
+    container_name: bb-api
+    restart: ${RESTART_POLICY:-unless-stopped}
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - MONGODB_URI=${MONGODB_URI:-mongodb://mongodb:27017/bb-db}
+      - PORT=${PORT:-3000}
+      - HOST=${HOST:-0.0.0.0}
+      - AUTO_SEED=${AUTO_SEED:-true}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - ENABLE_REQUEST_LOGGING=${ENABLE_REQUEST_LOGGING:-true}
+      - DB_MAX_POOL_SIZE=${DB_MAX_POOL_SIZE:-10}
+      - DB_SERVER_SELECTION_TIMEOUT=${DB_SERVER_SELECTION_TIMEOUT:-5000}
+      - DB_SOCKET_TIMEOUT=${DB_SOCKET_TIMEOUT:-45000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3001}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS:-100}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW:-60000}
+      - SESSION_SECRET=${SESSION_SECRET:-dev-session-secret}
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret}
+    volumes:
+      # Source code volume mounts for live editing
+      - ./server.js:/app/server.js
+      - ./models.js:/app/models.js
+      - ./seed.js:/app/seed.js
+      - ./docker-seed.js:/app/docker-seed.js
+      - ./docker-start.sh:/app/docker-start.sh
+      - ./env-config.js:/app/env-config.js
+      - ./package.json:/app/package.json
+      - ./package-lock.json:/app/package-lock.json
+      - ./nodemon.json:/app/nodemon.json
+      # Exclude node_modules from host mount, use named volume instead
+      - api_node_modules:/app/node_modules
+    networks:
+      - bb-network
+    depends_on:
+      mongodb:
+        condition: service_healthy
+        restart: true
+    command: sh -c "npm run docker-seed; npm run dev"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/health"]
+      interval: ${HEALTH_CHECK_INTERVAL:-15}s
+      timeout: ${HEALTH_CHECK_TIMEOUT:-10}s
+      retries: ${HEALTH_CHECK_RETRIES:-3}
+      start_period: ${HEALTH_CHECK_START_PERIOD:-60}s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-3}"
+
+  # Frontend Service
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev.frontend
+    container_name: bb-frontend
+    restart: ${RESTART_POLICY:-unless-stopped}
+    ports:
+      - "${FRONTEND_PORT:-3001}:${FRONTEND_PORT:-3001}"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - VITE_API_URL=${VITE_API_URL:-http://localhost:3000}
+      - CHOKIDAR_USEPOLLING=${CHOKIDAR_USEPOLLING:-true}
+    volumes:
+      # Source code volume mounts for live editing
+      - ./src:/app/src
+      - ./index.html:/app/index.html
+      - ./vite.config.ts:/app/vite.config.ts
+      - ./tsconfig.json:/app/tsconfig.json
+      - ./tsconfig.node.json:/app/tsconfig.node.json
+      - ./package.json:/app/package.json
+      - ./package-lock.json:/app/package-lock.json
+      # Exclude node_modules from host mount, use named volume instead
+      - frontend_node_modules:/app/node_modules
+    networks:
+      - bb-network
+    depends_on:
+      api:
+        condition: service_healthy
+        restart: true
+    command: npx vite --host ${FRONTEND_HOST:-0.0.0.0} --port ${FRONTEND_PORT:-3001}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${FRONTEND_PORT:-3001}"]
+      interval: ${HEALTH_CHECK_INTERVAL:-15}s
+      timeout: ${HEALTH_CHECK_TIMEOUT:-10}s
+      retries: ${HEALTH_CHECK_RETRIES:-3}
+      start_period: ${HEALTH_CHECK_START_PERIOD:-45}s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-3}"
+
+# Named volumes for data persistence
+volumes:
+  mongodb_data:
+    driver: local
+  api_node_modules:
+    driver: local
+  frontend_node_modules:
+    driver: local
+
+# Shared network for service communication
+networks:
+  bb-network:
+    driver: bridge

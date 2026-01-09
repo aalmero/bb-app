@@ -1,0 +1,65 @@
+# Docker Compose override for production deployment with external load balancer
+# Use this file in conjunction with docker-compose.prod.yml for load-balanced deployments
+# Usage: docker compose -f docker-compose.prod.yml -f docker-compose.prod.lb.yml up -d
+
+services:
+  # Nginx Load Balancer
+  nginx-lb:
+    image: nginx:alpine
+    container_name: basketball-nginx-lb
+    ports:
+      - "${LB_HTTP_PORT:-80}:80"
+      - "${LB_HTTPS_PORT:-443}:443"
+      - "${LB_STATUS_PORT:-8080}:8080"
+    volumes:
+      - ./nginx-lb.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${SSL_CERT_PATH:-./ssl}:/etc/ssl:ro
+      - nginx_logs:/var/log/nginx
+    networks:
+      - basketball-network
+    depends_on:
+      - api
+      - frontend
+    restart: ${RESTART_POLICY:-unless-stopped}
+    deploy:
+      replicas: ${LB_REPLICAS:-1}
+      resources:
+        limits:
+          cpus: "${LB_CPU_LIMIT:-0.5}"
+          memory: "${LB_MEMORY_LIMIT:-256M}"
+        reservations:
+          cpus: "${LB_CPU_RESERVATION:-0.1}"
+          memory: "${LB_MEMORY_RESERVATION:-64M}"
+      restart_policy:
+        condition: ${DEPLOY_RESTART_CONDITION:-on-failure}
+        delay: ${DEPLOY_RESTART_DELAY:-5s}
+        max_attempts: ${DEPLOY_MAX_ATTEMPTS:-3}
+        window: ${DEPLOY_RESTART_WINDOW:-120s}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/lb-health"]
+      interval: ${HEALTH_CHECK_INTERVAL:-15}s
+      timeout: ${HEALTH_CHECK_TIMEOUT:-10}s
+      retries: ${HEALTH_CHECK_RETRIES:-3}
+      start_period: ${HEALTH_CHECK_START_PERIOD:-30}s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "${LOG_MAX_SIZE:-50m}"
+        max-file: "${LOG_MAX_FILES:-5}"
+        labels: "service=load-balancer,environment=production"
+
+  # Override API service to remove external port exposure (load balancer handles it)
+  api:
+    ports: []  # Remove external port exposure
+    expose:
+      - "${API_INTERNAL_PORT:-3000}"
+
+  # Override Frontend service to remove external port exposure (load balancer handles it)
+  frontend:
+    ports: []  # Remove external port exposure
+    expose:
+      - "${FRONTEND_INTERNAL_PORT:-80}"
+
+volumes:
+  nginx_logs:
+    driver: local

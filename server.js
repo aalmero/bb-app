@@ -5,11 +5,152 @@ const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 const { Club, Schedule, TeamStat, PlayerStat } = require('./models');
 
-const app = express();
-app.use(express.json());
-app.use(cors());
+// Load environment configuration
+const envConfig = require('./env-config');
 
-mongoose.connect('mongodb://localhost:27017/unrival-db');
+const app = express();
+
+// Enhanced logging configuration for container environments
+const isProduction = envConfig.get('NODE_ENV') === 'production';
+const isDevelopment = envConfig.get('NODE_ENV') === 'development';
+const logLevel = envConfig.get('LOG_LEVEL', 'info');
+const enableRequestLogging = envConfig.getBool('ENABLE_REQUEST_LOGGING', true);
+
+// Configure logging based on environment
+const log = {
+  info: (message, ...args) => {
+    if (['debug', 'info', 'warn', 'error'].includes(logLevel)) {
+      const timestamp = new Date().toISOString();
+      console.log(`[${timestamp}] INFO: ${message}`, ...args);
+    }
+  },
+  error: (message, ...args) => {
+    if (['debug', 'info', 'warn', 'error'].includes(logLevel)) {
+      const timestamp = new Date().toISOString();
+      console.error(`[${timestamp}] ERROR: ${message}`, ...args);
+    }
+  },
+  warn: (message, ...args) => {
+    if (['debug', 'info', 'warn', 'error'].includes(logLevel)) {
+      const timestamp = new Date().toISOString();
+      console.warn(`[${timestamp}] WARN: ${message}`, ...args);
+    }
+  },
+  debug: (message, ...args) => {
+    if (logLevel === 'debug') {
+      const timestamp = new Date().toISOString();
+      console.debug(`[${timestamp}] DEBUG: ${message}`, ...args);
+    }
+  }
+};
+
+// Request logging middleware for container environments
+if (enableRequestLogging) {
+  app.use((req, res, next) => {
+    const start = Date.now();
+    
+    // Skip logging for health checks in production to reduce noise
+    if (req.path === '/health' && isProduction) {
+      return next();
+    }
+    
+    res.on('finish', () => {
+      const duration = Date.now() - start;
+      const logLevel = res.statusCode >= 400 ? 'error' : 'info';
+      log[logLevel](`${req.method} ${req.path} ${res.statusCode} - ${duration}ms`);
+    });
+    
+    next();
+  });
+}
+
+app.use(express.json());
+
+// Configure CORS with environment-specific origins
+const corsOrigins = envConfig.getArray('CORS_ORIGINS', ['http://localhost:3001']);
+app.use(cors({
+  origin: corsOrigins,
+  credentials: true
+}));
+
+// Use environment variable for MongoDB connection
+const mongoUri = envConfig.get('MONGODB_URI');
+const dbMaxPoolSize = envConfig.getInt('DB_MAX_POOL_SIZE', 10);
+const dbServerSelectionTimeout = envConfig.getInt('DB_SERVER_SELECTION_TIMEOUT', 5000);
+const dbSocketTimeout = envConfig.getInt('DB_SOCKET_TIMEOUT', 45000);
+
+// Connection retry logic for containerized environment
+const connectWithRetry = async () => {
+  const maxRetries = 10;
+  const retryDelay = 5000; // 5 seconds
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      log.info(`Attempting to connect to MongoDB (attempt ${attempt}/${maxRetries})...`);
+      await mongoose.connect(mongoUri, {
+        maxPoolSize: dbMaxPoolSize,
+        serverSelectionTimeoutMS: dbServerSelectionTimeout,
+        socketTimeoutMS: dbSocketTimeout,
+      });
+      log.info('Successfully connected to MongoDB');
+      return;
+    } catch (error) {
+      log.error(`Connection attempt ${attempt} failed:`, error.message);
+      
+      if (attempt === maxRetries) {
+        log.error('Max retries reached. Unable to connect to MongoDB');
+        throw error;
+      }
+      
+      log.info(`Retrying in ${retryDelay / 1000} seconds...`);
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
+  }
+};
+
+// Initialize connection with retry logic
+connectWithRetry().catch(error => {
+  log.error('Failed to connect to MongoDB:', error);
+  process.exit(1);
+});
+
+// Handle connection events with enhanced logging
+mongoose.connection.on('connected', () => {
+  log.info('Mongoose connected to MongoDB');
+});
+
+mongoose.connection.on('error', (err) => {
+  log.error('Mongoose connection error:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+  log.warn('Mongoose disconnected from MongoDB');
+});
+
+// Handle graceful shutdown
+process.on('SIGTERM', async () => {
+  log.info('SIGTERM received, shutting down gracefully');
+  try {
+    await mongoose.connection.close();
+    log.info('MongoDB connection closed');
+    process.exit(0);
+  } catch (error) {
+    log.error('Error during graceful shutdown:', error);
+    process.exit(1);
+  }
+});
+
+process.on('SIGINT', async () => {
+  log.info('SIGINT received, shutting down gracefully');
+  try {
+    await mongoose.connection.close();
+    log.info('MongoDB connection closed');
+    process.exit(0);
+  } catch (error) {
+    log.error('Error during graceful shutdown:', error);
+    process.exit(1);
+  }
+});
 
 const swaggerOptions = {
   definition: {
@@ -19,13 +160,163 @@ const swaggerOptions = {
       version: '1.0.0',
       description: 'API for managing basketball schedules, team stats, player stats, and clubs'
     },
-    servers: [{ url: 'http://localhost:3000' }]
+    servers: [{ 
+      url: envConfig.get('API_BASE_URL', 'http://localhost:3000'),
+      description: `${envConfig.get('NODE_ENV', 'development')} server`
+    }]
   },
   apis: ['./server.js']
 };
 
 const specs = swaggerJsdoc(swaggerOptions);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(specs));
+
+// Enhanced health check endpoint for Docker with detailed monitoring
+app.get('/health', async (req, res) => {
+  try {
+    const healthStatus = {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      service: 'basketball-api',
+      version: envConfig.get('npm_package_version', '1.0.0'),
+      environment: envConfig.get('NODE_ENV', 'development'),
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      database: {
+        state: 'unknown',
+        healthy: false,
+        error: null,
+        responseTime: null
+      }
+    };
+
+    // Check database connection with timing
+    const dbStartTime = Date.now();
+    const dbState = mongoose.connection.readyState;
+    const dbStates = {
+      0: 'disconnected',
+      1: 'connected',
+      2: 'connecting',
+      3: 'disconnecting'
+    };
+    
+    healthStatus.database.state = dbStates[dbState] || 'unknown';
+    
+    if (dbState === 1) {
+      try {
+        await mongoose.connection.db.admin().ping();
+        healthStatus.database.healthy = true;
+        healthStatus.database.responseTime = Date.now() - dbStartTime;
+      } catch (error) {
+        healthStatus.database.error = error.message;
+        healthStatus.database.responseTime = Date.now() - dbStartTime;
+        healthStatus.status = 'unhealthy';
+      }
+    } else {
+      healthStatus.database.error = `Database is ${healthStatus.database.state}`;
+      healthStatus.status = 'unhealthy';
+    }
+    
+    // Add additional health metrics
+    const memUsage = process.memoryUsage();
+    healthStatus.metrics = {
+      memoryUsage: {
+        rss: Math.round(memUsage.rss / 1024 / 1024), // MB
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024), // MB
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024), // MB
+        external: Math.round(memUsage.external / 1024 / 1024) // MB
+      },
+      uptime: {
+        seconds: Math.round(process.uptime()),
+        human: formatUptime(process.uptime())
+      }
+    };
+    
+    const statusCode = healthStatus.status === 'healthy' ? 200 : 503;
+    
+    // Log health check failures for monitoring
+    if (statusCode !== 200) {
+      log.warn('Health check failed', { 
+        status: healthStatus.status, 
+        dbState: healthStatus.database.state,
+        dbError: healthStatus.database.error 
+      });
+    }
+    
+    res.status(statusCode).json(healthStatus);
+  } catch (error) {
+    log.error('Health check endpoint error:', error);
+    res.status(503).json({
+      status: 'unhealthy',
+      timestamp: new Date().toISOString(),
+      service: 'basketball-api',
+      error: error.message,
+      uptime: process.uptime()
+    });
+  }
+});
+
+// Helper function to format uptime in human-readable format
+function formatUptime(seconds) {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  
+  if (days > 0) {
+    return `${days}d ${hours}h ${minutes}m ${secs}s`;
+  } else if (hours > 0) {
+    return `${hours}h ${minutes}m ${secs}s`;
+  } else if (minutes > 0) {
+    return `${minutes}m ${secs}s`;
+  } else {
+    return `${secs}s`;
+  }
+}
+
+// Readiness probe endpoint (for Kubernetes-style orchestration)
+app.get('/ready', async (req, res) => {
+  try {
+    // Check if the service is ready to accept traffic
+    const dbState = mongoose.connection.readyState;
+    
+    if (dbState === 1) {
+      // Perform a quick database operation to ensure readiness
+      await mongoose.connection.db.admin().ping();
+      res.status(200).json({
+        status: 'ready',
+        timestamp: new Date().toISOString(),
+        service: 'basketball-api'
+      });
+    } else {
+      res.status(503).json({
+        status: 'not ready',
+        timestamp: new Date().toISOString(),
+        service: 'basketball-api',
+        reason: 'Database not connected'
+      });
+    }
+  } catch (error) {
+    log.error('Readiness check failed:', error);
+    res.status(503).json({
+      status: 'not ready',
+      timestamp: new Date().toISOString(),
+      service: 'basketball-api',
+      error: error.message
+    });
+  }
+});
+
+// Liveness probe endpoint (for Kubernetes-style orchestration)
+app.get('/live', (req, res) => {
+  // Simple liveness check - if the process is running, it's alive
+  res.status(200).json({
+    status: 'alive',
+    timestamp: new Date().toISOString(),
+    service: 'basketball-api',
+    uptime: process.uptime()
+  });
+});
 
 /**
  * @swagger
@@ -131,9 +422,38 @@ app.post('/clubs', async (req, res) => {
   }
 });
 
+app.get('/clubs/:id', async (req, res) => {
+  try {
+    const club = await Club.findById(req.params.id);
+    if (!club) {
+      return res.status(404).json({ error: 'Club not found' });
+    }
+    res.json(club);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 /**
  * @swagger
  * /clubs/{id}:
+ *   get:
+ *     summary: Get a club by ID
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Club found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Club'
+ *       404:
+ *         description: Club not found
  *   put:
  *     summary: Update a club
  *     parameters:
@@ -467,7 +787,17 @@ app.delete('/player_stats/:id', async (req, res) => {
   }
 });
 
-app.listen(3000, '0.0.0.0', () => {
-  console.log('Server running on port 3000');
-  console.log('API docs available at http://localhost:3000/api-docs');
+const port = envConfig.getInt('PORT', 3000);
+const host = envConfig.get('HOST', '0.0.0.0');
+
+app.listen(port, host, () => {
+  log.info('Server starting up...');
+  log.info(`Server running on ${host}:${port}`);
+  log.info(`API docs available at http://${host === '0.0.0.0' ? 'localhost' : host}:${port}/api-docs`);
+  log.info(`Health check available at http://${host === '0.0.0.0' ? 'localhost' : host}:${port}/health`);
+  log.info(`Readiness check available at http://${host === '0.0.0.0' ? 'localhost' : host}:${port}/ready`);
+  log.info(`Liveness check available at http://${host === '0.0.0.0' ? 'localhost' : host}:${port}/live`);
+  log.info(`Environment: ${envConfig.get('NODE_ENV', 'development')}`);
+  log.info(`MongoDB URI: ${mongoUri.replace(/\/\/.*@/, '//***:***@')}`); // Mask credentials in logs
+  log.info(`CORS Origins: ${corsOrigins.join(', ')}`);
 });

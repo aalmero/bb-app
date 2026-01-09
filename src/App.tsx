@@ -12,11 +12,12 @@ function Dashboard() {
       dispatch({ type: 'SET_LOADING', payload: true })
       
       try {
+        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
         const [clubsRes, schedulesRes, teamStatsRes, playerStatsRes] = await Promise.all([
-          fetch('http://localhost:3000/clubs'),
-          fetch('http://localhost:3000/schedules'),
-          fetch('http://localhost:3000/team_stats'),
-          fetch('http://localhost:3000/player_stats')
+          fetch(`${apiUrl}/clubs`),
+          fetch(`${apiUrl}/schedules`),
+          fetch(`${apiUrl}/team_stats`),
+          fetch(`${apiUrl}/player_stats`)
         ])
         
         const clubs = await clubsRes.json()

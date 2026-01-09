@@ -1,0 +1,20 @@
+{
+  "watch": [
+    "server.js",
+    "models.js",
+    "seed.js"
+  ],
+  "ext": "js,json",
+  "ignore": [
+    "node_modules/",
+    "test/",
+    "*.test.js",
+    ".git/"
+  ],
+  "env": {
+    "NODE_ENV": "development"
+  },
+  "delay": 1000,
+  "verbose": true,
+  "restartable": "rs"
+}
